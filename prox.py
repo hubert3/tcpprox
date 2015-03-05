@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3.4
 """
 TCP Proxy server.  Listens on a port for connections, initiates
 a connection to the real server, and copies data between the
@@ -13,12 +13,13 @@ TODO:
 from socket import *
 import errno, optparse, os, socket, ssl, time
 from select import *
+from binascii import hexlify
 
 class Error(Exception) :
     pass
 
 def fail(fmt, *args) :
-    print "error:", fmt % args
+    print("error:", fmt % args)
     raise SystemExit(1)
 
 def tcpListen(six, addr, port, blk, sslProto, cert=None, key=None) :
@@ -39,12 +40,12 @@ def tcpListen(six, addr, port, blk, sslProto, cert=None, key=None) :
     s.setblocking(blk)
     return s
 
-def tcpConnect(six, addr, port, blk, sslProto) :
+def tcpConnect(six, addr, port, blk, sslProto, client_cert, client_cert_key) :
     """Returned a connected client socket (blocking on connect...)"""
     s = socket.socket(AF_INET6 if six else AF_INET, SOCK_STREAM)
     s.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
     if sslProto is not None :
-        s = ssl.wrap_socket(s, cert_reqs=ssl.CERT_NONE, ssl_version=sslProto)
+        s = ssl.wrap_socket(s, cert_reqs=ssl.CERT_NONE, ssl_version=sslProto, certfile=client_cert, keyfile=client_cert_key)
     s.connect((addr,port))
     s.setblocking(blk)
     return s
@@ -52,7 +53,7 @@ def tcpConnect(six, addr, port, blk, sslProto) :
 def safeClose(x) :
     try :
         x.close()
-    except Exception, e :
+    except Exception as e :
         pass
 
 def getSslVers(opt, enable) :
@@ -60,16 +61,17 @@ def getSslVers(opt, enable) :
         if opt.sslV3 :
             return ssl.PROTOCOL_SSLv3
         elif opt.TLS :
-            return ssl.PROTOCOL_TLSv1
+            return ssl.PROTOCOL_TLSv1_2
         else :
             return ssl.PROTOCOL_SSLv23
 
 class Server(object) :
     def __init__(self, opt, q) :
         self.opt = opt
-        sslCert = opt.cert + ".pem"
+        sslCert = opt.cert
+        sslKey = opt.key
         ver = getSslVers(opt, opt.sslIn)
-        self.sock = tcpListen(opt.ip6, opt.bindAddr, opt.locPort, 0, ver, sslCert, None)
+        self.sock = tcpListen(opt.ip6, opt.bindAddr, opt.locPort, 0, ver, sslCert, sslKey)
         self.q = q
     def preWait(self, rr, r, w, e) :
         r.append(self.sock)
@@ -77,8 +79,8 @@ class Server(object) :
         if self.sock in r :
             try :
                 cl,addr = self.sock.accept()
-            except ssl.SSLError, e :
-                print "ssl error during accept", e
+            except ssl.SSLError as e :
+                print("ssl error during accept", e)
                 return
             cl.setblocking(0)
             self.q.append(Proxy(self.opt, cl, addr))
@@ -117,20 +119,20 @@ class Half(object) :
         return self.err
 
     def error(self, msg, e) :
-        print "%s on %s: %r %s" % (msg, self.name, e, e)
+        print("%s on %s: %r %s" % (msg, self.name, e, e))
         self.err = "error on " + self.name
         return self.err
 
     def writeSome(self) :
         try :
             n = self.sock.send(self.queue[0])
-        except ssl.SSLError, e :
+        except ssl.SSLError as e :
             # XXX can we get WantRead here?
             if e.args[0] == ssl.SSL_ERROR_WANT_WRITE :
                 n = 0
             else :
                 return self.error("send ssl error", e)
-        except Exception, e :
+        except Exception as e :
             return self.error("send error", e)
         if n != len(self.queue[0]) :
             self.queue[0] = self.queue[0][n:]
@@ -140,7 +142,7 @@ class Half(object) :
     def copy(self) :
         try :
             buf = self.sock.recv(4096)
-        except ssl.SSLError, e :
+        except ssl.SSLError as e :
             # XXX can we get WantWrite here?
             if e.args[0] == ssl.SSL_ERROR_WANT_READ :
                 self.ready = False
@@ -148,20 +150,23 @@ class Half(object) :
             if e.args[0] == ssl.SSL_ERROR_EOF :
                 return self.error("eof", e)
             return self.error("recv ssl error", e)
-        except socket.error, e : 
+        except socket.error as e : 
             if e.errno == errno.EWOULDBLOCK :
                 self.ready = False
                 return
             return self.error("recv socket error", e)
-        except Exception, e :
+        except Exception as e :
             return self.error("recv error", e)
         if len(buf) == 0 :
             return self.error("eof", 0)
         self.dest.queue.append(buf)
+        print(buf)
+        print()
+        #print(hexlify(buf))
         if self.opt.log :
             now = time.time()
             a = '%s:%s' % self.addr
-            self.opt.log.write("%f %s %s %s\n" % (now, a, self.dir, buf.encode('hex')))
+            self.opt.log.write("%f %s %s %s\n" % (now, a, self.dir, hexlify(buf)))
             self.opt.log.flush()
     def close(self) :
         safeClose(self.sock)
@@ -169,12 +174,12 @@ class Half(object) :
 class Proxy(object) :
     """A client connection and the peer connection he proxies to"""
     def __init__(self, opt, sock, addr) :
-        print "New client %s" % (addr,)
+        print("New client %s" % (addr,))
         self.opt = opt
         self.cl = Half(opt, sock, addr, 'i')
         # note: blocking connect for simplicity for now...
         ver = getSslVers(opt, opt.sslOut)
-        peer = tcpConnect(opt.ip6, opt.addr, opt.port, 0, ver)
+        peer = tcpConnect(opt.ip6, opt.addr, opt.port, 0, ver, opt.client_cert, opt.client_cert_key)
         self.peer = Half(opt, peer, addr, 'o')
 
         self.cl.dest = self.peer
@@ -209,7 +214,7 @@ def serverLoop(opt) :
         for q in qs :
             if q.postWait(r, w, e) :
                 qs.remove(q)
-    print 'done'
+    print('done')
 
 def autoCert(cn, caName, name) :
     """Create a certificate signed by caName for cn into name."""
@@ -227,8 +232,11 @@ def getopts() :
     p.add_option("--ssl-in", dest="sslIn", action="store_true", help="Use SSL for incoming connections")
     p.add_option("--ssl-out", dest="sslOut", action="store_true", help="Use SSL for outgoing connections")
     p.add_option('-3', dest='sslV3', action='store_true', help='Use SSLv3 protocol')
-    p.add_option('-T', dest='TLS', action='store_true', help='Use TLSv1 protocol')
-    p.add_option("-C", dest="cert", default=None, help="Cert for SSL")
+    p.add_option('-T', dest='TLS', action='store_true', help='Use TLSv1_2 protocol')
+    p.add_option("--listener_cert", dest="cert", default=None, help="Cert for SSL listener")
+    p.add_option("--listener_key", dest="key", default=None, help="Key for SSL listener")    
+    p.add_option("--client_cert", dest="client_cert", default=None, help="Client certificate")
+    p.add_option("--client_cert_key", dest="client_cert_key", default=None, help="Client certificate key")    
     p.add_option("-A", dest="autoCname", action="store", help="CName for Auto-generated SSL cert")
     p.add_option('-1', dest='oneshot', action='store_true', help="Handle a single connection")
     p.add_option("-l", dest="logFile", help="Filename to log to")
@@ -263,7 +271,7 @@ def main() :
     if opt.sslIn and opt.autoCname :
         autoCert(opt.autoCname, opt.cert, "autocert")
         opt.cert = "autocert"
-    opt.log = file(opt.logFile, 'w') if opt.logFile else None
+    opt.log = open(opt.logFile, 'w') if opt.logFile else None
     serverLoop(opt)
 
 if __name__ == '__main__' :
